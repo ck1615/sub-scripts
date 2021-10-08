@@ -1,0 +1,657 @@
+#!/bin/bash
+
+##Script to submit electronic structure calculations on one of three HPC
+##clusters: cx1 or young.
+## Christopher Keegan, written in December 2020
+
+##Default values of global variables
+cluster="young"
+software="q-e"
+calc_type="sp"
+num_mpi=40
+memory_per_core=5
+walltime=03:00:00
+gold=Gold
+scriptname=""
+verbose=""
+name="CK"
+
+## Auxiliary global variables
+calc_type_name=""
+CALCDIR=""                    #Name of remote Scratch or WORK directory in HPC
+DIR_NAME=""                   #Directory where calculations are done in Scratch
+account=""                    #Name of account for young calculations
+seed=""                       #Calculation filename(s)
+num_calcs=                    #Number of calculations to run
+keep_scriptfile=
+
+################################ FUNCTIONS ###################################
+
+function usage () { 
+   echo "Usage: clustersub <options> <seedname>" 
+   echo "Options:"
+   echo "-c <cluster>              Determines to which cluster the calculation
+   will be performed on. Default: ${cluster}"
+   echo "-s <software>             Software to use to run the calculation.
+   Default: ${software}."        
+   echo "-t <calculation type>     Calculation to run on code. Default:
+   ${calc_type}."
+   echo "-d <WORKDIR>              Name of directory in which to place files.
+    Default: Random string directory in the workspace."
+   echo "-n <number>               Number of MPI processes. Default: ${num_mpi}"
+   echo "-m <memory>               Amount of memory per process requested in megabytes. Default: ${memory_per_core}"
+   echo "-W <walltime>             Walltime requested in HH:MM:SS format. Default: ${walltime}"
+   echo "-p <paid|free>            Whether to submit a paid job or a low-priority (free) job. Default: ${gold}"
+   echo "-S <scriptname>           Saves job script in <scriptname>"
+   echo "-r                       Sends files over to cluster"
+   exit 0
+}
+
+function parse_input_args() {
+  : '
+  This function parses the input arguments for this script using getopts.
+
+  Usage: parse_input_args
+  '
+while getopts 'vc:s:t:n:m:W:p:s:d:rh' OPTION
+do
+  case $OPTION in
+    #Verbosity
+    v) verbose=true
+      ;; 
+    #Cluster
+    c) if [[ "$OPTARG" == "cx1" ]]; then 
+          cluster=$OPTARG
+          num_mpi=32
+          memory_per_core=124
+        elif [[ "$OPTARG" == "young" ]]; then
+          cluster=$OPTARG
+          num_mpi=40
+          memory_per_core=5
+      else
+        echo "Cluster requested is ${OPTARG}, which is not one of cx1 or young." >&2
+        exit 0
+      fi 
+      ;;
+    #Software package
+    s) if [[ "$OPTARG" =~ ^(castep|q-e|vasp|elk)$ ]]; then
+        software=$OPTARG 
+        [[ $verbose ]] && echo "Software package to be used is $software." >&2
+      else
+        echo "Software package specified, $OPTARG, is not yet supported." >&2
+        exit 0
+      fi
+      ;;
+    t) if [[ "$OPTARG" =~ ^(sp|bs|dos|pdos|go|phonon)$ ]]; then
+        case $OPTARG in 
+          sp) calc_type_name="Single point energy"
+            ;;
+          bs) calc_type_name="Electronic band structure"
+            ;;
+          dos) calc_type_name="Density of states"
+            ;;
+          pdos) calc_type_name="Projected density of states"
+            ;; 
+          go) calc_type_name="Geometry optimisation"
+            ;;
+          phonon) calc_type_name="Phonon"
+            ;;
+        esac
+        [[ $verbose ]] && echo "$calc_type_name calculation to be performed.">&2
+        calc_type=$OPTARG
+      else
+        echo "$OPTARG is not a recognised calculation keyword. Allowed options
+are: sp, bs, dos, pdos, go, phonon." >&2
+      fi
+      ;; 
+    d) DIR_NAME=$OPTARG
+      ;;
+    n) if [ $OPTARG -le 0 ]; then
+        echo "Number of cores must be a strictly positive integer." >&2
+      else
+        num_mpi=$OPTARG
+      fi
+      ;;
+    m) memory_per_core="$OPTARG"
+      ;;
+    W) walltime=$OPTARG
+      ;;
+    p) gold=$OPTARG
+      ;;
+    s) scriptname=$OPTARG
+      ;;
+    r) SEND_TO_CLUSTER=1
+      ;; 
+    h) usage
+      ;; 
+    *) 
+      echo "Option $OPTION not accepted.">&2
+      exit 0
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+}
+
+function number_of_jobs() {
+  : '
+  This function determines the number of jobs to be executed according to the
+software used and the number of corresponding input files in the current work-
+-ing directory.
+
+Supported software: (i) castep, (ii) quantum-espresso
+
+Usage: number_of_jobs software type
+  '
+case $1 in 
+  castep) 
+    local N_calcs=$(ls *.cell | wc -l)
+    ;;
+  q-e) 
+    if [[ "$calc_type" == "sp" ]]; then
+      local N_calcs=$(ls *.scf.in | wc -l)
+    elif [[ "$calc_type" == "bs" ]]; then
+      local N_calcs=$(ls *.bands.in | wc -l)
+    elif [[ "$calc_type" == "dos" ]]; then
+      local N_calcs=$(ls *.nscf.in | wc -l)
+    elif [[ "$calc_type" == "pdos" ]]; then
+      local N_calcs=$(ls *.projwfc.in | wc -l)
+    elif [[ "$calc_type" == "go" ]]; then
+      local N_calcs=$(ls *.*relax.in | wc -l)
+    elif [[ "$calc_type" == "phonon" ]]; then
+      local N_calcs=$(ls *.ph*.in | wc -l)
+    fi
+    ;;
+  vasp)
+    local N_dirs=$( echo "`find . -mindepth 1 -maxdepth 1 -type d | wc -l`" |
+      xargs)
+    echo -e "Number of directories is: $N_dirs" >&2
+    if [[ "$N_dirs" == 0 ]]; then
+      N_calcs=1
+    elif [[ "$N_dirs" -gt 0 ]]; then
+      echo -e "Number of directories, $N_dirs, is not 0" >&2
+      N_calcs=$N_dirs
+    else
+      echo "ERROR: Number of directories is negative." >&2
+    fi
+    ;;
+  *) 
+    echo "ERROR: software package name, $1, not recognised or not yet imple
+mented." >&2
+    exit 0
+    ;;
+esac
+
+#Print out number of calculations
+echo $N_calcs
+}
+
+function create_paramfile() {
+  : '
+  This function creates the paramfile.txt file containing the calculation seeds
+  required to run the different jobs.
+
+  Usage: create_paramfile \$software
+  '
+
+  #Remove old paramfile
+  if [ -f "paramfile.txt" ]; then
+    rm paramfile.txt
+  fi
+  touch paramfile.txt
+
+  # Treat each software package case
+  case $1 in 
+    castep)
+      num=1
+      for file in *.cell
+      do
+        seed=$(basename $file .cell)
+        echo -e "$num $seed" >> paramfile.txt
+        num=$((num + 1))
+      done
+      ;;
+    q-e)
+      num=1
+      if [[ "$calc_type" =~ ^(sp|bs|dos|pdos)$ ]]; then
+        extension=*.scf.in
+      elif [[ "$calc_type" == "go" ]]; then
+        extension=*.*relax.in
+      fi
+      for file in $extension
+      do
+        echo -e "$num $file" >> paramfile.txt
+        num=$((num + 1))
+      done
+      ;;
+    vasp)
+      num=1
+      for dir in $(find . -mindepth 1 -maxdepth 1 -type d)
+      do
+        echo -e "$num $dir" >> paramfile.txt
+        num=$((num + 1))
+      done
+      ;;
+    *) 
+      echo "Wrong, or absent software name or unsupported software package:
+$1." >&2
+      ;;
+  esac
+    
+}
+
+function set_cluster_variables() {
+  : '
+  This function sets several key cluster-only dependent variables, namely the
+  account name and the directory for the calculations. 
+
+  Usage: write_scriptfile $cluster
+  '
+
+case $1 in 
+  young)
+  ## Define directory in which to run calculations
+  CALCDIR=/home/mmm0533/Scratch/$DIR_NAME
+  account="UKCP_IC_M" # Account for jobs
+  MPICMD=gerun
+  ;;
+  cx1)
+  CALCDIR=/rds/general/user/ck1615/home/WORK/$DIR_NAME
+  account=""
+  MPICMD=mpiexec
+  ;;
+esac
+
+}
+
+function single_job_seed() {
+  : '
+  This function finds the seed to use to run the required calculation in the
+  case of a single job run.
+
+    Usage: single_job_seed $software
+  '
+
+  case $1 in 
+    castep) 
+      fname=$(ls *.cell)
+      seed=${fname%*.cell}
+      ;;
+    q-e) 
+      if [[ "$calc_type" =~ ^(sp|bs|dos|pdos)$ ]]; then
+        extension=*.scf*in
+      elif [[ "$calc_type" == "go" ]]; then
+        extension=*.*relax.in
+      fi
+      seed=$(ls $extension) 
+      ;;
+    vasp) 
+      seed=''
+      ;;
+    *) 
+      echo "ERROR: software package not recognised or not yet implemented: 
+$1." >&2
+      exit 0
+      ;;
+  esac
+}
+
+function software_module_loads() {
+: '
+  This function writes to the scriptfile the commands to load the modules
+  necessary for the various software packages and clusters used. 
+
+  Usage: software_module_loads \$software \$cluster
+  '
+
+  #Check scriptfile name has been set
+  [[ -z "$scriptname" ]] && echo "ERROR: The scriptfile name has not yet been
+set or written." >&2 && exit 0
+
+  [[ -z "$CALCDIR" ]] && echo "ERROR: CALCDIR variable has not been set." >&2 &&
+  exit 0
+    
+  # Proceed if scriptfile name is set
+  case $1 in 
+    castep)
+      case $2 in 
+        young)
+          cat << EOT >> $scriptname
+      
+## Load modules
+module unload default-modules 
+module load gerun
+module load compilers/intel/2019/update4
+module load mpi/intel/2019/update4/intel
+module load castep
+
+#Run calculation
+$MPICMD castep.mpi \$seed
+EOT
+          ;; 
+        cx1)
+          cat << EOT >> $scriptname
+      
+## Load modules
+module load intel-suite 
+module load mpi/intel-2018
+module load castep/16.1
+
+#Run calculation
+$MPICMD castep.mpi \$seed
+EOT
+          ;;
+        *) 
+          echo "ERROR: $1 HPC system not recognised or not yet supported." >&2
+          exit 0
+          ;;
+      esac
+      ;;
+    q-e)
+      case $2 in 
+        young)
+          cat << EOT >> $scriptname
+      
+## Load modules
+export PATH=/home/mmm0533/local/bin/qe-6.7/bin:\$PATH
+
+#Run calculation
+$MPICMD pw.x -ndiag 1 -in \$seed > \${seed/.in/.out}
+EOT
+          ;; 
+        cx1)
+          cat << EOT >> $scriptname
+
+## Load modules 
+module load intel-suite
+module load mpi/intel-2018
+
+#Run calculation
+$MPICMD pw.x -in \$seed > \${seed/.in/.out}
+EOT
+          ;;
+        *) 
+          echo "ERROR: $2 HPC system not recognised or not yet supported." >&2
+          exit 0
+          ;;
+      esac
+      ;;
+    vasp)
+      case $2 in 
+        young)
+          cat << EOT >> $scriptname
+      
+## Load modules
+module unload default-modules
+module load compilers/intel/2019/update5
+module load mpi/intel/2019/update5/intel
+module load gerun rcps-core
+module load vasp
+
+#Run calculation
+cd $CALCDIR/\$seed
+gerun vasp_std >log 2>error
+EOT
+          ;; 
+        *) 
+          echo "ERROR: $1 HPC system not recognised or not yet supported." >&2
+          exit 0
+          ;;
+      esac
+      ;;
+    *) 
+      echo "ERROR: $1 not a recognised or supported software package">&2
+      exit 0
+      ;;
+  esac
+}
+
+function calc_type_execute() {
+  : '
+  This function writes the program execution commands for the different types
+  of calculations that can be executed using electronic-structure based soft-
+  ware packages.
+
+  Input arguments: $calc_type
+  '
+
+  case $calc_type in
+    sp)
+      : 
+      ;;
+    bs)
+      case $software in
+        castep)
+          :
+          ;;
+        q-e)
+          cat << EOT >> $scriptname
+#Band structure calculation
+bands=\${seed/scf/bands}
+$MPICMD pw.x -ndiag 1 -in \$bands > \${bands/in/out} 
+EOT
+          ;;
+        *)
+          echo "Error: band structure calculation with $software software
+          package not yet implemented."
+          ;;
+      esac
+      ;;
+    dos)
+      case $software in
+        castep)
+          cat << EOT >> $scriptname
+#DOS calculation using OptaDOS
+$MPICMD optados.mpi $seed
+EOT
+          ;;
+        q-e)
+          cat << EOT >> $scriptname
+#NSCF calculation for DOS
+nscf=\${seed/scf/nscf}
+$MPICMD pw.x -ndiag 1 -in \$nscf > \${nscf/in/out} 
+EOT
+          ;;
+
+        *)
+          echo "Error: band structure calculation with $software software
+          package not yet implemented."
+          ;;
+      esac
+      ;;
+    pdos)
+      case $software in
+        castep)
+          cat << EOT >> $scriptname
+#pDOS calculation using OptaDOS
+$MPICMD optados.mpi $seed
+EOT
+          ;;
+        q-e)
+          cat << EOT >> $scriptname
+#NSCF calculation
+nscf=\${seed/scf/nscf}
+$MPICMD pw.x -ndiag 1 -in \$nscf > \${nscf/in/out} 
+#PDOS calculation
+pwfc=\${seed/scf/projwfc}
+$MPICMD projwfc.x -in \$pwfc > \${pwfc/in/out}
+EOT
+          ;;
+        *)
+          echo "Error: band structure calculation with $software software
+          package not yet implemented."
+          ;;
+      esac
+      ;;
+  esac
+}
+
+function write_scriptfile() {
+  : '
+  This function writes the job scriptfile which will be submitted to the queue-
+  -ing system of HPC cluster.  
+  '
+######################### CLUSTER SPECIFIC SCRIPTFILE #########################
+#Set scriptfile name to default value if not given above
+if [[ ! "$scriptname" ]]; then
+  scriptname=scriptfile
+fi
+
+#Remove any previous scriptfile
+rm -f $scriptname
+
+#Generate a random alphanumeric string for the directory in the Scratch/ or
+#WORK/ space on the cluster IF not already set in the command line
+if [ "$DIR_NAME" == "" ]; then
+  #DIR_NAME=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 13 ; echo '')
+  if [ "$cluster" == "cx1" ]; then
+    DIR_NAME="\$PBS_O_WORKDIR"
+  else
+    DIR_NAME=""
+  fi
+fi
+
+#Get cluster-specific variables (directory and account name)
+set_cluster_variables $cluster
+
+##Generate the scriptfile to submit
+# YOUNG clusters
+if [[ "$cluster" == "young" ]]; then 
+    
+  #Write job scriptfile
+  cat > $scriptname << EOF
+#!/bin/bash -l 
+## Submission script created by clustersub for the ${cluster} HPC system
+## Christopher Keegan, December 2020
+
+#$ -S /bin/bash
+#$ -l h_rt=${walltime}
+#$ -l mem=${memory_per_core}G
+#$ -N CK
+#$ -pe mpi ${num_mpi}
+#$ -A ${account} 
+#$ -P ${gold}
+#$ -wd ${CALCDIR} 
+EOF
+# CX1 HPC system
+elif [[ "$cluster" == "cx1" ]]; then
+  # Write job scriptfile
+  cat > $scriptname << EOF
+#!/bin/bash
+#PBS -lselect=1:ncpus=${num_mpi}:mem=${memory_per_core}gb
+#PBS -lwalltime=${walltime}
+EOF
+fi
+
+##################### SINGLE OR ARRAY JOBS TREATMENT ##########################
+## Determine whether single or array job
+num_calcs=$(number_of_jobs $software)
+
+## ARRAY JOB TREATMENT
+if [[ "$num_calcs" -gt 1 ]]; then
+  ## Print to stdout if verbose mode activated.
+  [[ "$verbose" ]] && echo "This is an ARRAY job. Number of calculations: $num_calcs" >&2
+
+  ## Create the paramfile.txt containing the job seeds
+  create_paramfile $software
+
+  ## Append scriptfile with array job related lines
+  ## YOUNG
+  if [[ "$cluster" == "young" ]]; then
+    echo "Writing array part of scriptfile: $scriptname" >&2
+    cat << EOT >> $scriptname
+
+## Array job treatment
+#$ -t 1-$num_calcs
+# Parse parameter file to get variables
+number=\$SGE_TASK_ID
+paramfile=$CALCDIR/paramfile.txt
+
+seed="\`sed -n \${number}p \$paramfile | awk '{print \$2}'\`"
+EOT
+  ## CX1
+  elif [[ "$cluster" == "cx1" ]]; then
+    cat << EOT >> $scriptname
+
+## Array job treatment
+#PBS -J 1-$num_calcs
+number=\$PBS_ARRAY_INDEX
+paramfile=\$PBS_O_WORKDIR/paramfile.txt
+
+seed="\`sed -n \${number}p \$paramfile | awk '{print \$2}'\`"
+
+## Change to directory where job was submitted from
+cd \$PBS_O_WORKDIR 
+EOT
+  fi
+  [[ "$verbose" ]] && echo "Finished writing the array part of scriptfile." >&2
+## SINGLE JOB TREATMENT
+elif [[ "$num_calcs" == 1 ]]; then
+  ## Print to stdout if verbose mode activated.
+  [[ "$verbose" ]] && echo "This is an SINGLE job."
+
+  # Set calculation seed
+  single_job_seed $software
+
+  ## Append to scriptfile
+  cat << EOT >> $scriptname
+
+## Single job treatment
+seed=$seed
+EOT
+## Wrong number of input files
+else
+  echo "ERROR: Number of input files detected less than 1." >&2
+  exit 0
+fi
+
+[[ "$verbose" ]] && echo "Now we are writing the module loading parts for the 
+$software software and $cluster cluster." >&2
+
+########################## SOFTWARE PACKAGE SPECIFIC ##########################
+## Write module loading for software and cluster and execution
+software_module_loads $software $cluster
+
+## Write calculation-type specific execution lines
+calc_type_execute 
+
+}
+
+function send_to_hpc() {
+  : '
+  This function sends the input files to the HPC cluster and executes it.
+  '
+
+  #Set SSH ID for given cluster
+  case $1 in 
+    cx1) ssh_id="ck1615@login.hpc.ic.ac.uk" ;; 
+    young) ssh_id="mmm0533@young.rc.ucl.ac.uk" ;;
+    *) 
+      echo "No argument given or unsupported cluster: $1" >&2
+      exit 0
+      ;;
+  esac
+
+  #Create job directory on HPC system
+  ssh $ssh_id "[[ -d $CALCDIR ]] || mkdir $CALCDIR" 
+
+  #Copy all files in CWD over to the $CALCDIR
+  rsync -auvz . $ssh_id:$CALCDIR/. 
+
+  #Submit calculations on HPC system
+  #ssh $ssh_id "cd $CALCDIR; qsub scriptfile"
+
+}
+
+############################### EXECUTION ####################################
+
+#Parse input arguments
+parse_input_args $@
+
+#Write scriptfile
+write_scriptfile
+
+#Send to HPC
+if [[ "$SEND_TO_CLUSTER" == 1 ]]; then
+  send_to_hpc $cluster
+fi

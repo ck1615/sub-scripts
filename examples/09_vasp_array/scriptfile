@@ -1,0 +1,31 @@
+#!/bin/bash -l 
+## Submission script created by clustersub for the young HPC system
+## Christopher Keegan, December 2020
+
+#$ -S /bin/bash
+#$ -l h_rt=00:15:00
+#$ -l mem=1G
+#$ -N calculation
+#$ -pe mpi 24
+#$ -A Imperial_Mat 
+#$ -P Gold
+#$ -wd /home/mmm0533/Scratch/REfTgiHUNdblL 
+
+## Array job treatment
+#$ -t 1-11
+# Parse parameter file to get variables
+number=$SGE_TASK_ID
+paramfile=/home/mmm0533/Scratch/REfTgiHUNdblL/paramfile.txt
+
+seed="`sed -n ${number}p $paramfile | awk '{print $2}'`"
+      
+## Load modules
+module unload default-modules
+module load compilers/intel/2019/update5
+module load mpi/intel/2019/update5/intel
+module load gerun rcps-core
+module load vasp
+
+#Run calculation
+cd /home/mmm0533/Scratch/REfTgiHUNdblL/$seed
+gerun vasp_std >log 2>error

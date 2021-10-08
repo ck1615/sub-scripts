@@ -1,0 +1,12 @@
+#!/bin/bash -l 
+## Submission script created by clustersub for the young HPC system
+## Christopher Keegan, December 2020
+
+#$ -S /bin/bash
+#$ -l h_rt=00:15:00
+#$ -l mem=1G
+#$ -N calculation
+#$ -pe mpi 24
+#$ -A Imperial_Mat 
+#$ -P Gold
+#$ -wd /home/mmm0533/Scratch/zBdbqiLke9tVI 
