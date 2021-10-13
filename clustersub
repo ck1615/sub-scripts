@@ -353,7 +353,7 @@ EOT
           cat << EOT >> $scriptname
       
 ## Load modules
-export PATH=/home/mmm0533/local/bin/qe-6.7/bin:\$PATH
+export PATH=/home/mmm0533/local/bin/qe-6.8/bin:\$PATH
 
 #Run calculation
 $MPICMD pw.x -ndiag 1 -in \$seed > \${seed/.in/.out}
